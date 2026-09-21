@@ -1,0 +1,355 @@
+/*
+  41099 I2ME A3 2026 Starter - Serial Admin Option
+
+  Edit STUDENT_ID before your viva. At the start of the viva, copy the
+  single identity line from Serial Monitor into the Teams chat:
+
+  12345678: AA:BB:CC:DD:EE:FF
+
+  Board/circuit assumption for this starter:
+  - Arduino UNO R4 WiFi is the normal board.
+  - Lock button: D3 to GND, using INPUT_PULLUP.
+  - Unlock button: D4 to GND, using INPUT_PULLUP.
+  - IR proximity sensor digital output: D7. LOW means person detected.
+  - Status light pins: red D5 and green D6, each with resistor.
+  - Brightness potentiometer or LDR divider: A0.
+  - Servo signal: D9.
+
+  State table:
+  1 UNLOCKED: green, person detected opens the door.
+  2 EXIT_DELAY: green, locking has started.
+  3 WARNING: green flashing at B_HZ.
+  4 FINAL_WARNING: yellow.
+  5 LOCKED_WAIT: red/green alternating at E_HZ.
+  6 LOCKED: red, door stays closed.
+  7 UNLOCKING: red flashing at G_HZ, then returns to UNLOCKED.
+
+  When the door is moving, the status light flashes red at DOOR_HZ.
+*/
+
+#include <Servo.h>
+
+const char STUDENT_ID[] = "12345678"; // TODO: replace with your student number
+
+// ===== DO NOT EDIT: board identity code starts here =====
+#ifndef TINKERCAD_SIMULATION
+#if defined(ARDUINO_AVR_UNO) || defined(__AVR_ATmega328P__)
+#define TINKERCAD_SIMULATION 1
+#else
+#define TINKERCAD_SIMULATION 0
+#endif
+#endif
+
+#if !TINKERCAD_SIMULATION && defined(ARDUINO_UNOR4_WIFI)
+#include <WiFiS3.h>
+#endif
+
+void printBoardIdentity(){char s[64];
+#if TINKERCAD_SIMULATION
+sprintf(s,"%s: TINKERCAD_SIM",STUDENT_ID);
+#elif defined(ARDUINO_UNOR4_WIFI)
+byte m[6];WiFi.macAddress(m);sprintf(s,"%s: %02X:%02X:%02X:%02X:%02X:%02X",STUDENT_ID,m[5],m[4],m[3],m[2],m[1],m[0]);
+#else
+sprintf(s,"%s: NO_WIFI_BOARD_APPROVED",STUDENT_ID);
+#endif
+Serial.println(s);}
+// ===== DO NOT EDIT: board identity code ends here =====
+
+const int LOCK_BUTTON_PIN = 3;
+const int UNLOCK_BUTTON_PIN = 4;
+const int IR_SENSOR_PIN = 7;
+const int RED_PIN = 5;
+const int GREEN_PIN = 6;
+const int BRIGHTNESS_PIN = A0;
+const int SERVO_PIN = 9;
+const int PERSON_DETECTED_LEVEL = LOW;
+
+const int DOOR_CLOSED_ANGLE = 90;
+const int DOOR_OPEN_ANGLE = 0;
+const int PERSON_WAIT_TIME = 3000;
+const int MAX_BUTTON_PRESS_TIME = 1200;
+const int MIN_LED_BRIGHTNESS = 5;
+
+// TODO: These A-H values are starter values for the placeholder STUDENT_ID.
+// After changing STUDENT_ID, update these timing/frequency parameters using
+// the assignment specification. The code does not calculate them automatically.
+int A_TIME = 3000;
+int B_HZ = 1;
+int C_TIME = 3000;
+int D_TIME = 5000;
+int E_HZ = 5;
+int F_TIME = 4000;
+int G_HZ = 7;
+int H_TIME = 2000;
+int DOOR_HZ = 2;
+int DOOR_SPEED = 45;
+
+const int UNLOCKED = 1;
+const int EXIT_DELAY = 2;
+const int WARNING = 3;
+const int FINAL_WARNING = 4;
+const int LOCKED_WAIT = 5;
+const int LOCKED = 6;
+const int UNLOCKING = 7;
+int securityState = UNLOCKED;
+unsigned long stateStartedAt = 0;
+
+Servo doorServo;
+int doorAngle = DOOR_CLOSED_ANGLE;
+int targetDoorAngle = DOOR_CLOSED_ANGLE;
+unsigned long lastDoorStepAt = 0;
+bool doorMoving = false;
+bool personPresent = false;
+unsigned long lastPersonPresentAt = 0;
+
+bool lastLockReading = HIGH;
+bool lastUnlockReading = HIGH;
+unsigned long lastLockPressAt = 0;
+int lockPressCount = 0;
+
+bool adminMode = false;
+
+void setup() {
+  pinMode(LOCK_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(UNLOCK_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BRIGHTNESS_PIN, INPUT);
+
+  doorServo.attach(SERVO_PIN);
+  doorServo.write(DOOR_CLOSED_ANGLE);
+
+  Serial.begin(9600);
+  delay(500);
+  Serial.setTimeout(100);
+  printBoardIdentity();
+  Serial.println("Type password to open admin menu.");
+}
+
+void loop() {
+  updateButtons();
+  updateSecurityState();
+  updateDoor();
+  updateStatusLight();
+  updateSerialMenu();
+}
+
+void updateButtons() {
+  bool lockReading = digitalRead(LOCK_BUTTON_PIN);
+  bool unlockReading = digitalRead(UNLOCK_BUTTON_PIN);
+
+  if (lastLockReading == HIGH && lockReading == LOW) {
+    handleLockPress();
+  }
+  if (lastUnlockReading == HIGH && unlockReading == LOW) {
+    unlockSystem();
+  }
+
+  lastLockReading = lockReading;
+  lastUnlockReading = unlockReading;
+}
+
+void handleLockPress() {
+  unsigned long now = millis();
+  if (now - lastLockPressAt > MAX_BUTTON_PRESS_TIME) lockPressCount = 0;
+  lockPressCount++;
+  lastLockPressAt = now;
+
+  if (lockPressCount >= 3) {
+    emergencyLock();
+    lockPressCount = 0;
+  } else if (securityState == UNLOCKED) {
+    changeState(EXIT_DELAY);
+  }
+}
+
+void unlockSystem() {
+  if (securityState < LOCKED) changeState(UNLOCKED);
+  else if (securityState == LOCKED) changeState(UNLOCKING);
+}
+
+void emergencyLock() {
+  targetDoorAngle = DOOR_CLOSED_ANGLE;
+  changeState(LOCKED);
+}
+
+void changeState(int nextState) {
+  securityState = nextState;
+  stateStartedAt = millis();
+}
+
+void updateSecurityState() {
+  unsigned long elapsed = millis() - stateStartedAt;
+
+  if (securityState == EXIT_DELAY && elapsed >= A_TIME) changeState(WARNING);
+  else if (securityState == WARNING && elapsed >= C_TIME) changeState(FINAL_WARNING);
+  else if (securityState == FINAL_WARNING && elapsed >= D_TIME) changeState(LOCKED_WAIT);
+  else if (securityState == LOCKED_WAIT && elapsed >= F_TIME) changeState(LOCKED);
+  else if (securityState == UNLOCKING && elapsed >= H_TIME) changeState(UNLOCKED);
+}
+
+void updateDoor() {
+  unsigned long now = millis();
+  personPresent = digitalRead(IR_SENSOR_PIN) == PERSON_DETECTED_LEVEL;
+
+  if (securityState != UNLOCKED) {
+    targetDoorAngle = DOOR_CLOSED_ANGLE;
+  } else if (personPresent) {
+    targetDoorAngle = DOOR_OPEN_ANGLE;
+    lastPersonPresentAt = now;
+  } else if (now - lastPersonPresentAt >= PERSON_WAIT_TIME) {
+    targetDoorAngle = DOOR_CLOSED_ANGLE;
+  }
+
+  int doorStepWait = max(10, 1000 / DOOR_SPEED);
+  if (doorAngle != targetDoorAngle && now - lastDoorStepAt >= (unsigned long)doorStepWait) {
+    lastDoorStepAt = now;
+    doorAngle += (doorAngle < targetDoorAngle) ? 1 : -1;
+    doorServo.write(doorAngle);
+    lastPersonPresentAt = now;
+  }
+  doorMoving = doorAngle != targetDoorAngle;
+}
+
+void updateStatusLight() {
+  int rawBrightness = analogRead(BRIGHTNESS_PIN);
+  int brightness = constrain(map(rawBrightness, 0, 1023, MIN_LED_BRIGHTNESS, 255), MIN_LED_BRIGHTNESS, 255);
+
+  if (doorMoving) {
+    bool blinkOn = flashOnAtHz(DOOR_HZ);
+    setStatusLight(blinkOn ? brightness : 0, 0);
+    return;
+  }
+
+  if (securityState == UNLOCKED) setStatusLight(0, brightness);
+  else if (securityState == EXIT_DELAY) setStatusLight(0, brightness);
+  else if (securityState == WARNING) setStatusLight(0, flashOnAtHz(B_HZ) ? brightness : 0);
+  else if (securityState == FINAL_WARNING) setStatusLight(brightness, brightness);
+  else if (securityState == LOCKED_WAIT) {
+    if (flashOnAtHz(E_HZ)) setStatusLight(brightness, 0);
+    else setStatusLight(0, brightness);
+  }
+  else if (securityState == UNLOCKING) setStatusLight(flashOnAtHz(G_HZ) ? brightness : 0, 0);
+  else setStatusLight(brightness, 0);
+}
+
+bool flashOnAtHz(int hz) {
+  if (hz < 1) hz = 1;
+  unsigned long halfPeriod = 500UL / hz;
+  if (halfPeriod < 1) halfPeriod = 1;
+  return (millis() / halfPeriod) % 2 == 0;
+}
+
+void setStatusLight(int redValue, int greenValue) {
+  analogWrite(RED_PIN, constrain(redValue, 0, 255));
+  analogWrite(GREEN_PIN, constrain(greenValue, 0, 255));
+}
+
+void updateSerialMenu() {
+  if (Serial.available() > 0) {
+    String line = Serial.readString();
+    processSerialLine(line);
+  }
+}
+
+void processSerialLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+  String upperLine = line;
+  upperLine.toUpperCase();
+
+  if (!adminMode) {
+    if (upperLine == "I2ME") {
+      adminMode = true;
+      printAdminHelp();
+    } else {
+      Serial.println("Wrong password.");
+    }
+    return;
+  }
+
+  if (upperLine == "EXIT") {
+    adminMode = false;
+    Serial.println("Admin menu closed.");
+  } else if (upperLine == "STATUS") {
+    printStatus();
+  } else if (upperLine == "HELP" || upperLine == "?") {
+    printAdminHelp();
+  } else if (upperLine.startsWith("SPEED ")) {
+    DOOR_SPEED = constrain(line.substring(6).toInt(), 5, 120);
+    Serial.println("Door speed updated.");
+  } else if (upperLine.length() == 1) {
+    printParameter(upperLine.charAt(0));
+  } else if (upperLine.length() >= 3 && upperLine.charAt(1) == ' ') {
+    updateParameter(upperLine.charAt(0), line.substring(2).toInt());
+  } else {
+    Serial.println("Unknown command.");
+    printAdminHelp();
+  }
+}
+
+void printAdminHelp() {
+  Serial.println("Admin menu commands:");
+  Serial.println("status");
+  Serial.println("speed N");
+  Serial.println("A/C/D/F/H N  for timing in ms");
+  Serial.println("B/E/G N      for flashing in Hz");
+  Serial.println("exit");
+}
+
+void updateParameter(char label, long newValue) {
+  if (label == 'B' || label == 'E' || label == 'G') {
+    if (newValue < 1 || newValue > 10) {
+      Serial.println("Frequency must be 1 to 10 Hz.");
+      return;
+    }
+    if (label == 'B') B_HZ = newValue;
+    else if (label == 'E') E_HZ = newValue;
+    else G_HZ = newValue;
+    Serial.println("Frequency updated.");
+    return;
+  }
+
+  if (newValue < 100 || newValue > 30000) {
+    Serial.println("Timing must be 100 to 30000 ms.");
+    return;
+  }
+
+  if (label == 'A') A_TIME = newValue;
+  else if (label == 'C') C_TIME = newValue;
+  else if (label == 'D') D_TIME = newValue;
+  else if (label == 'F') F_TIME = newValue;
+  else if (label == 'H') H_TIME = newValue;
+  else {
+    Serial.println("Use A/C/D/F/H for timing or B/E/G for frequency.");
+    return;
+  }
+  Serial.println("Timing updated.");
+}
+
+void printParameter(char label) {
+  if (label == 'A') { Serial.print("A_TIME = "); Serial.print(A_TIME); Serial.println(" ms. To change it, type A 4000."); }
+  else if (label == 'B') { Serial.print("B_HZ = "); Serial.print(B_HZ); Serial.println(" Hz. To change it, type B 4."); }
+  else if (label == 'C') { Serial.print("C_TIME = "); Serial.print(C_TIME); Serial.println(" ms. To change it, type C 4000."); }
+  else if (label == 'D') { Serial.print("D_TIME = "); Serial.print(D_TIME); Serial.println(" ms. To change it, type D 4000."); }
+  else if (label == 'E') { Serial.print("E_HZ = "); Serial.print(E_HZ); Serial.println(" Hz. To change it, type E 4."); }
+  else if (label == 'F') { Serial.print("F_TIME = "); Serial.print(F_TIME); Serial.println(" ms. To change it, type F 4000."); }
+  else if (label == 'G') { Serial.print("G_HZ = "); Serial.print(G_HZ); Serial.println(" Hz. To change it, type G 4."); }
+  else if (label == 'H') { Serial.print("H_TIME = "); Serial.print(H_TIME); Serial.println(" ms. To change it, type H 4000."); }
+  else {
+    Serial.println("Unknown command.");
+    printAdminHelp();
+  }
+}
+
+void printStatus() {
+  Serial.print("State: ");
+  Serial.print((int)securityState);
+  Serial.print(", brightness raw: ");
+  Serial.print(analogRead(BRIGHTNESS_PIN));
+  Serial.print(", door angle: ");
+  Serial.print(doorAngle);
+  Serial.print(", speed: ");
+  Serial.println(DOOR_SPEED);
+}
